@@ -1,0 +1,30 @@
+# Gradle and Kotlin build output (keep gradle/wrapper/gradle-wrapper.jar: it is needed by ./gradlew)
+.gradle/
+.kotlin/
+build/
+out/
+
+# Android
+local.properties
+.cxx/
+.externalNativeBuild/
+captures/
+*.apk
+*.aab
+
+# Signing keys and secrets: never commit
+*.jks
+*.keystore
+*.gpg
+*.asc
+secring.*
+
+# IDE, editors, OS
+*.iml
+.idea/
+.vscode/
+.DS_Store
+*.log
+*.hprof
+
+PUBLISHING.md
