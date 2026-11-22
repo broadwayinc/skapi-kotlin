@@ -46,7 +46,7 @@ public class SkapiSession internal constructor(
  * storage: where the signed-in session is kept between runs. MemoryStorage (default) keeps it for
  *   this object only; FileStorage keeps it in a JSON file; on Android use skapi-android's
  *   SharedPreferencesStorage. Or any SkapiStorage of your own.
- * timeoutSeconds: how long to wait for each request.
+ * timeoutSeconds: how long a request may go with nothing sent or received before it fails with TIMEOUT.
  * encryption: EncryptionOptions to seal the data of private records on the device before upload.
  *
  * Every method that talks to the server is a suspend function, run on Dispatchers.IO, and throws
@@ -407,7 +407,7 @@ public class Skapi @JvmOverloads constructor(
 
     /**
      * Calls another API through Skapi. options: "url" (required), "method", "headers", "data",
-     * "params", "secretName", "skapiHeaders", "queue", "expires", "stream", "poll", "multipart",
+     * "params", "secretName", "skapiHeaders", "queue", "expires", "stream", "poll" (milliseconds, 1000 or more; 0 does not poll), "multipart",
      * "responseType". form: form fields (JsonElement, String, numbers, ByteArray or FileUpload values),
      * merged into data or params, or sent as the multipart body. onStream(text, seq) receives
      * streamed text as it arrives.
@@ -415,7 +415,10 @@ public class Skapi @JvmOverloads constructor(
     public suspend fun forwardRequest(options: JsonObject, form: Map<String, Any?>? = null, onStream: ((String, Int) -> Unit)? = null): JsonElement =
         io { core.forwardRequest(options.toAny().asMap() ?: LinkedHashMap(), form?.let { formValues(it) }, onStream).toJson() }
 
-    /** Waits for a queued request (its request_id, or its short id with url and method) and returns the answer. */
+    /**
+     * Waits for a queued request (its request_id, or its short id with url and method) and returns the answer.
+     * pollMillis: milliseconds between checks, 1000 or more (0 means the default, 1000).
+     */
     public suspend fun forwardRequestPoll(requestId: String, pollMillis: Long = 1000, url: String? = null, method: String? = null,
                                           onStream: ((String, Int) -> Unit)? = null, service: String? = null, owner: String? = null): JsonElement =
         io { core.forwardRequestPoll(requestId, pollMillis.toDouble(), url, method, onStream, service, owner).toJson() }

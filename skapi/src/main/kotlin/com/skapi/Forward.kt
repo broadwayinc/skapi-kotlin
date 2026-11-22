@@ -179,10 +179,24 @@ internal fun Core.forwardRequest(options: JMap, form: JMap?, onStream: ((String,
     return dispatchForward(params, onStream, responseType as String?)
 }
 
+/**
+ * The shortest polling interval accepted, in milliseconds (skapi-js 2.4.4 MIN_POLL_INTERVAL_MS). A shorter
+ * one is refused with INVALID_PARAMETER, never raised quietly: forwardRequest's "poll" (0 still means
+ * "do not poll"), forwardRequestPoll's `poll` and forwardRequestStream's "poll".
+ */
+public const val MIN_POLL_INTERVAL_MS: Double = 1000.0
+
+private fun assertPollInterval(value: Double, name: String = "poll") {
+    if (!value.isFinite() || value < MIN_POLL_INTERVAL_MS) {
+        throw perr("\"$name\" should be a number of milliseconds, ${MIN_POLL_INTERVAL_MS.toInt()} or more.")
+    }
+}
+
 private fun Core.dispatchForward(params: JMap, onStream: ((String, Int) -> Unit)?, responseType: String?): Any? {
     val secretNamed = truthy(params["secretName"])
     val poll = params.remove("poll")
-    if (poll is Number && poll.toDouble() < 0) throw perr("\"poll\" should be a non-negative number.")
+    // 0 (or false, or absent) means "do not poll"; any other number is the interval.
+    if (poll is Number && poll.toDouble() != 0.0) assertPollInterval(poll.toDouble())
     val latency: Double = if (poll is Number) poll.toDouble() else if (truthy(poll)) 1000.0 else 0.0
     ensureConnection()
     val signedIn = signedIn()
@@ -305,8 +319,8 @@ internal fun Core.forwardRequestPoll(
     owner: String? = null,
 ): Any? {
     if (poll.isNaN()) throw perr("\"poll\" should be a number.")
-    if (poll < 0) throw perr("\"poll\" should be a non-negative number.")
     val wait = if (poll == 0.0) 1000.0 else poll
+    assertPollInterval(wait)
     val fullId = fullRequestId(requestId, url, method, service)
     ensureConnection()
     var cursor = 0L
@@ -351,7 +365,7 @@ internal fun Core.forwardRequestStream(requestId: String, options: JMap?, onStre
     val o = options.copyMap()
     val poll = o["poll"]
     val latency = if (poll is Number) poll.toDouble() else 1000.0
-    if (latency < 0) throw perr("\"poll\" should be a non-negative number.")
+    assertPollInterval(latency)
     if (o.containsKey("since") && o["since"] !is Number) throw perr("\"since\" should be a number.")
     val fullId = fullRequestId(requestId, o["url"], o["method"], o["service"])
     ensureConnection()

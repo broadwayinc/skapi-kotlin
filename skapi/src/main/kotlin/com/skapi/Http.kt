@@ -5,6 +5,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.net.SocketTimeoutException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
@@ -21,6 +22,11 @@ internal const val DEFAULT_TARGET_CDN = "d3e9syvbtso631"
 internal const val ENDPOINT_VERSION = "v2"
 internal val KNOWN_ERROR_CODES = setOf("INVALID_CORS", "INVALID_REQUEST", "SERVICE_DISABLED", "INVALID_PARAMETER", "ERROR", "EXISTS", "NOT_EXISTS")
 internal const val RATE_LIMIT_MAX_RETRIES = 6
+// Uploads (2.4.4): once the whole body is written, MB can still drain from the OS buffers with
+// nothing to show, so the answer may take this many times `timeoutSeconds` before the upload
+// counts as stalled. Writing already has an idle limit: OkHttp's writeTimeout applies to each
+// write, never to the file's total time, so a slow upload that keeps moving is not cut off.
+internal const val UPLOAD_SENT_WAIT_FACTOR = 5L
 
 internal val ADMIN_ROUND_ROBIN = setOf(
     "get-newsletters", "get-public-newsletters", "subscribe-newsletter", "subscribe-public-newsletter",
@@ -104,6 +110,11 @@ internal class Requester(
         .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
         .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
         .build()
+
+    /** `client` with the longer wait for the answer after an upload body is sent. */
+    private val uploadClient: OkHttpClient by lazy {
+        client.newBuilder().readTimeout(timeoutSeconds * UPLOAD_SENT_WAIT_FACTOR, TimeUnit.SECONDS).build()
+    }
 
     // ---- endpoints ------------------------------------------------------------------------------
 
@@ -295,7 +306,8 @@ internal class Requester(
         return result
     }
 
-    fun send(url: String, method: String, headers: Map<String, String>, payload: ByteArray?, raw: Boolean = false): Any? {
+    fun send(url: String, method: String, headers: Map<String, String>, payload: ByteArray?, raw: Boolean = false,
+             uploadName: String? = null): Any? {
         var attempt = 0
         while (true) {
             val hb = Headers.Builder()
@@ -307,7 +319,7 @@ internal class Requester(
                 throw perr("\"$url\" is not a valid url.")
             }
             try {
-                client.newCall(req).execute().use { resp ->
+                (if (uploadName != null) uploadClient else client).newCall(req).execute().use { resp ->
                     val content = resp.body?.bytes() ?: ByteArray(0)
                     if (resp.isSuccessful) {
                         if (raw) return content
@@ -334,6 +346,14 @@ internal class Requester(
                     }
                     throw parseError(resp.code, text)
                 }
+            } catch (e: SocketTimeoutException) {
+                if (uploadName != null) {
+                    throw skErr("Upload timeout: \"$uploadName\" stalled (nothing sent for $timeoutSeconds seconds, " +
+                        "or no answer ${timeoutSeconds * UPLOAD_SENT_WAIT_FACTOR} seconds after it was sent).", "TIMEOUT", e)
+                }
+                // Nothing moved for timeoutSeconds (OkHttp's read/write timeouts are idle limits): TIMEOUT,
+                // as skapi-js 2.4.4 does ("No response for 60 seconds.").
+                throw skErr("No response for $timeoutSeconds seconds.", "TIMEOUT", e)
             } catch (e: IOException) {
                 throw skErr("Network error", "NETWORK_ERROR", e)
             }
@@ -354,6 +374,8 @@ internal class Requester(
                 }
                 throw parseError(resp.code, text)
             }
+        } catch (e: SocketTimeoutException) {
+            throw skErr("No response for $timeoutSeconds seconds.", "TIMEOUT", e)
         } catch (e: IOException) {
             throw skErr("Network error", "NETWORK_ERROR", e)
         } catch (e: IllegalArgumentException) {
@@ -373,6 +395,7 @@ internal class Requester(
             "Content-Type: ${contentType ?: "application/octet-stream"}\r\n\r\n"))
         out.write(content)
         out.write(utf8("\r\n--$boundary--\r\n"))
-        return send(url, "POST", mapOf("Content-Type" to "multipart/form-data; boundary=$boundary"), out.toByteArray())
+        return send(url, "POST", mapOf("Content-Type" to "multipart/form-data; boundary=$boundary"), out.toByteArray(),
+            uploadName = filename)
     }
 }
