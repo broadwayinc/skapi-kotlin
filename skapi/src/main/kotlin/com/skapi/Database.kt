@@ -704,7 +704,11 @@ internal fun Core.setupPostConfig(config: JMap?): Pair<JMap, String?> {
             if (v.toDouble() < 0) throw perr("\"reference_limit\" should be >= 0")
             if (v.toDouble() > 4503599627370546.0) throw perr("\"reference_limit\" should be <= 4503599627370546")
         }
-        for (k in listOf("prevent_multiple_referencing", "can_remove_referencing_records", "only_granted_can_reference", "allow_granted_to_grant_others")) {
+        // can_modify_referencing_records: the owner of this record may update the data, tags and index of the
+        // records referencing it, or unlink them (reference: null). The uploader can turn it on only when
+        // creating the record (later only the project owner or an admin in access group 99) and off at any time.
+        for (k in listOf("prevent_multiple_referencing", "can_remove_referencing_records", "can_modify_referencing_records",
+            "only_granted_can_reference", "allow_granted_to_grant_others")) {
             if (s.containsKey(k) && s[k] !is Boolean) throw perr("\"source.$k\" should be type: <boolean>.")
         }
         if (s.containsKey("referencing_index_restrictions")) {
@@ -1285,7 +1289,7 @@ internal fun Core.normalizeRecord(record: Any?, skipDataFetch: Boolean = false, 
         "feed_referencing_records" to false, "notify_referencing_records" to false)
     val table = jmap("name" to "", "access_group" to 0L, "subscription" to subscription)
     val source = jmap("referencing_limit" to null, "prevent_multiple_referencing" to false, "can_remove_referencing_records" to false,
-        "only_granted_can_reference" to false)
+        "can_modify_referencing_records" to false, "only_granted_can_reference" to false)
     val bin = LinkedHashMap<String, Any?>()
     val out = jmap("user_id" to "", "record_id" to "", "updated" to 0L, "uploaded" to 0L, "readonly" to false, "table" to table,
         "referenced_count" to 0L, "source" to source, "ip" to "", "bin" to bin)
@@ -1307,7 +1311,11 @@ internal fun Core.normalizeRecord(record: Any?, skipDataFetch: Boolean = false, 
     val ctUrl = ctUrls.firstOrNull()
 
     if (r.containsKey("ip")) {
-        val parts = (r["ip"]?.let { if (it is String) it else jsJson(it) } ?: "None").split("#")
+        // Stored as "<ip>[R]#<unique_id>". The address part is redacted for anyone but the uploader, the
+        // project owner and admins in access group 99: it comes back empty ("R#<unique_id>", "#<unique_id>"
+        // or "") for a signed-in uploader and as 0-0-0-0 for an anonymous one, so the anonymous check below
+        // still holds and the readonly flag and unique_id are still read. A missing value counts as empty.
+        val parts = ((r["ip"] as? String) ?: "").split("#")
         var ip = parts[0]
         if (parts.size > 1) out["unique_id"] = parts.drop(1).joinToString("#")
         if (ip.endsWith("R")) {
@@ -1386,6 +1394,11 @@ internal fun Core.normalizeRecord(record: Any?, skipDataFetch: Boolean = false, 
     if (prv != null) {
         for ((k, v) in prv) {
             when {
+                // Not a source setting: the user id of whoever last updated this record when that was not its
+                // uploader (the referenced record's owner through can_modify_referencing_records, the project
+                // owner or an admin). The backend keeps it in prv_acs because prv_acs is projected into every
+                // index; it drops the key once the uploader updates the record again.
+                k == "upb" -> if (v is String && v.isNotEmpty()) out["updated_by"] = v
                 k in setOf("notify_subscribers", "upload_to_feed", "feed_referencing_records", "notify_referencing_records") -> subscription[k] = v
                 k == "referencing_index_restrictions" && v is List<*> -> source[k] = v.map { i ->
                     val im = i.asMap()
