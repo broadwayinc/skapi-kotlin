@@ -7,7 +7,7 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
 
 /** The version of skapi-kotlin, sent to the server as skapi_version. */
-public const val SKAPI_VERSION: String = "2.4.4"
+public const val SKAPI_VERSION: String = "2.5.0"
 
 internal const val TOKEN_REFRESH_SKEW_SECONDS = 60 * 60 // refresh the ID token when it has less than an hour left
 

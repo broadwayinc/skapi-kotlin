@@ -5,9 +5,9 @@ The [Skapi](https://www.skapi.com) backend for Kotlin, Android and Java: sign us
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.skapi:skapi-kotlin:2.4.4")
-    implementation("com.skapi:skapi-android:2.4.4") // Android apps: session storage, device key store, lifecycle
-    implementation("com.skapi:skapi-java:2.4.4")    // Java code: CompletableFuture methods, plain Java maps and lists
+    implementation("com.skapi:skapi-kotlin:2.5.0")
+    implementation("com.skapi:skapi-android:2.5.0") // Android apps: session storage, device key store, lifecycle
+    implementation("com.skapi:skapi-java:2.5.0")    // Java code: CompletableFuture methods, plain Java maps and lists
 }
 ```
 
@@ -58,6 +58,7 @@ Layout:
 - `skapi-java/`: `SkapiJava`, `SkapiJson`, `FetchOptionsBuilder` and `EncryptionOptionsBuilder` (`com.skapi.java`): every `Skapi` method returning a `CompletableFuture`, with `Map<String, Object>` and `List<Object>` in place of kotlinx JSON. Java 8 bytecode, a layer over `skapi/`.
 
 Build: `./gradlew :skapi:jar :skapi-java:jar` (and `./gradlew :skapi-android:assembleRelease` with an Android SDK).
+Offline checks of the record decoding and postRecord validation: `./tests/referencing-owner-rights.sh`.
 
 Documentation: https://jvm.skapi.com
 
