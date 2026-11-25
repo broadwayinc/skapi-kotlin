@@ -280,7 +280,13 @@ public class Skapi @JvmOverloads constructor(
     public suspend fun removePrivateRecordAccess(recordId: String, userIds: List<String>): JsonElement =
         io { core.removePrivateRecordAccess(jmap("record_id" to recordId, "user_id" to userIds.toMutableList<Any?>())).toJson() }
 
-    /** Who can read a private record (recordId), or which private records a user can read (userIds). */
+    /**
+     * Who can read a private record (recordId), or which private records a user can read (userIds).
+     * Only users with access to the data can list: a record's grants by its uploader, the users it was
+     * shared with, the users with private access to the record it references, the project owner and
+     * admins in access group 99; userIds alone by that user, the project owner and admins in access
+     * group 99. Anyone else gets INVALID_REQUEST.
+     */
     public suspend fun listPrivateRecordAccess(recordId: String? = null, userIds: List<String>? = null, fetchOptions: FetchOptions? = null): JsonObject =
         io {
             val p = LinkedHashMap<String, Any?>()
@@ -289,7 +295,10 @@ public class Skapi @JvmOverloads constructor(
             core.listPrivateRecordAccess(p, fetchOptions?.toMap()).toJsonObject()
         }
 
-    /** A key to read a private record shared with you (kept and renewed by this object; you rarely need it yourself). */
+    /**
+     * A key to read a private record shared with you (kept and renewed by this object; you rarely need it yourself).
+     * With [referenceId], the key is given only when [recordId] references that record directly and you uploaded it or were granted it, or when you were granted that record itself.
+     */
     public suspend fun requestPrivateRecordAccessKey(recordId: String, referenceId: String? = null): String =
         io { core.requestPrivateRecordAccessKey(jmap("record_id" to recordId, "reference_id" to referenceId)) }
 
