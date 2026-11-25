@@ -6,6 +6,7 @@ import com.skapi.FileUpload
 import com.skapi.MemoryStorage
 import com.skapi.Skapi
 import com.skapi.SkapiException
+import com.skapi.SkapiAbortSignal
 import com.skapi.SkapiSession
 import com.skapi.SkapiStorage
 import kotlinx.coroutines.CoroutineScope
@@ -378,6 +379,20 @@ public class SkapiJava(
     public fun getRealtimeGroups(params: Map<String, *>? = null, fetchOptions: FetchOptions? = null): CompletableFuture<MutableMap<String, Any?>> =
         call { map(skapi.getRealtimeGroups(objOrNull(params), fetchOptions)) }
 
+    /**
+     * Listens to status changes of this user's forwarded requests dispatched with "notify": true (see
+     * Skapi.onRequestStatus). callback gets {"type": "status", "id", "queue", "status", "previous",
+     * "updated", "executed"}, {"type": "connected"} and {"type": "disconnected"}, on a background
+     * thread. Returns a Runnable that removes the listener.
+     */
+    public fun onRequestStatus(callback: Consumer<MutableMap<String, Any?>>): Runnable {
+        val remove = skapi.onRequestStatus { event -> callback.accept(map(event)) }
+        return Runnable { remove() }
+    }
+
+    /** True while request status frames are arriving on this client. */
+    public fun isRequestStatusLive(): Boolean = skapi.isRequestStatusLive()
+
     // ---- API bridge -----------------------------------------------------------------------------
 
     /**
@@ -390,8 +405,9 @@ public class SkapiJava(
 
     @JvmOverloads
     public fun forwardRequestPoll(requestId: String, pollMillis: Long = 1000, url: String? = null, method: String? = null,
-                                  onStream: BiConsumer<String, Int>? = null, service: String? = null, owner: String? = null): CompletableFuture<Any?> =
-        call { java(skapi.forwardRequestPoll(requestId, pollMillis, url, method, stream(onStream), service, owner)) }
+                                  onStream: BiConsumer<String, Int>? = null, service: String? = null, owner: String? = null,
+                                  notify: Boolean = false): CompletableFuture<Any?> =
+        call { java(skapi.forwardRequestPoll(requestId, pollMillis, url, method, stream(onStream), service, owner, notify)) }
 
     @JvmOverloads
     public fun forwardRequestStream(requestId: String, options: Map<String, *>? = null, onStream: BiConsumer<String, Int>? = null): CompletableFuture<Any?> =
@@ -402,8 +418,33 @@ public class SkapiJava(
         call { java(skapi.forwardRequestFinalize(requestId, if (data == null) null else el(data), objOrNull(options))) }
 
     @JvmOverloads
-    public fun forwardRequestHistory(params: Map<String, *>, fetchOptions: FetchOptions? = null): CompletableFuture<MutableMap<String, Any?>> =
-        call { map(skapi.forwardRequestHistory(obj(params), fetchOptions)) }
+    public fun forwardRequestHistory(params: Map<String, *>, fetchOptions: FetchOptions? = null,
+                                     signal: SkapiAbortSignal? = null): CompletableFuture<MutableMap<String, Any?>> =
+        call { map(skapi.forwardRequestHistory(obj(params), fetchOptions, signal)) }
+
+    /**
+     * Where many forwarded requests stand, in one call per 100. requests: full request ids (String)
+     * or maps {"id", "url", "method"} with the short id. options: "deadline", "fresh", "service",
+     * "owner". Completes with {"list"} in the order asked.
+     */
+    @JvmOverloads
+    public fun forwardRequestStatus(requests: List<*>, options: Map<String, *>? = null,
+                                    signal: SkapiAbortSignal? = null): CompletableFuture<MutableMap<String, Any?>> =
+        call { map(skapi.forwardRequestStatus(requests.map { el(it) }, objOrNull(options), signal)) }
+
+    /** The counters of up to 20 queues: {"queues": {name: {"cnt", "rct", "seq", "in_queue"}}}. */
+    @JvmOverloads
+    public fun forwardRequestQueueCounters(queues: List<String>, options: Map<String, *>? = null,
+                                           signal: SkapiAbortSignal? = null): CompletableFuture<MutableMap<String, Any?>> =
+        call { map(skapi.forwardRequestQueueCounters(queues, objOrNull(options), signal)) }
+
+    /**
+     * Reads one forwarded request in full, always as {"id", "status", "body"?, "error"?, "chunks"?, ...}.
+     * params: "id" (with "url" and "method", or a full id), "since", "service", "owner", "deadline", "fresh".
+     */
+    @JvmOverloads
+    public fun forwardRequestRead(params: Map<String, *>, signal: SkapiAbortSignal? = null): CompletableFuture<MutableMap<String, Any?>> =
+        call { map(skapi.forwardRequestRead(obj(params), signal)) }
 
     public fun cancelForwardRequest(params: Map<String, *>): CompletableFuture<Any?> = call { java(skapi.cancelForwardRequest(obj(params))) }
 

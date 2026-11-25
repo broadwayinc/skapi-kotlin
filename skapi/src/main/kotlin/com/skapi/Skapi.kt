@@ -112,6 +112,7 @@ public class Skapi @JvmOverloads constructor(
      * JVM program can exit. The object cannot be used after this. The session stays saved in storage.
      */
     public fun close() {
+        try { core.statusPush.shutdown() } catch (e: Exception) { }
         try { core.closeRealtime() } catch (e: Exception) { }
         core.stopAnonymousKeepAlive()
         core.scheduler.shutdownNow()
@@ -403,12 +404,39 @@ public class Skapi @JvmOverloads constructor(
     public suspend fun getRealtimeGroups(params: JsonObject? = null, fetchOptions: FetchOptions? = null): JsonObject =
         io { core.getRealtimeGroups(params?.toAny().asMap(), fetchOptions?.toMap()).toJsonObject() }
 
+    /**
+     * Listens to status changes of this user's forwarded requests that were dispatched with
+     * "notify": true, including ones this client holds no poll for (a pass the server queued as the
+     * continuation of one, or a request sent from another device). Each change arrives as
+     * {"type": "status", "id", "queue", "status", "previous", "updated", "executed"}.
+     *
+     * The realtime connection is kept open while a listener is registered (one is opened when the
+     * app has none and a user is signed in; the app's own realtime callback never sees these
+     * frames). The callback also gets {"type": "connected"} whenever the listener lands on an open
+     * connection (first time, after every reconnect, and the planned renewal) and
+     * {"type": "disconnected"} when it loses it. Frames are not kept for a connection that is down,
+     * so re-read what you show on "connected". callback runs on a background thread.
+     *
+     * A status event is a hint, not the outcome: read the request for that.
+     * Returns a function that removes the listener.
+     */
+    public fun onRequestStatus(callback: (JsonObject) -> Unit): () -> Unit =
+        core.onRequestStatus { event -> callback(event.toJsonObject()) }
+
+    /**
+     * True while request status frames are arriving on this client (see onRequestStatus). Polls of
+     * "notify" requests run slowly only while this is true.
+     */
+    public fun isRequestStatusLive(): Boolean = core.isRequestStatusLive()
+
     // ---- API bridge -------------------------------------------------------------------------------
 
     /**
      * Calls another API through Skapi. options: "url" (required), "method", "headers", "data",
      * "params", "secretName", "skapiHeaders", "queue", "expires", "stream", "poll" (milliseconds, 1000 or more; 0 does not poll), "multipart",
-     * "responseType". form: form fields (JsonElement, String, numbers, ByteArray or FileUpload values),
+     * "responseType", "cref" (your own reference, 1 to 64 letters, digits, "_" or "-", stored on the
+     * request and handed back by every read), "notify" (status push for a queued request, see
+     * onRequestStatus). form: form fields (JsonElement, String, numbers, ByteArray or FileUpload values),
      * merged into data or params, or sent as the multipart body. onStream(text, seq) receives
      * streamed text as it arrives.
      */
@@ -417,23 +445,67 @@ public class Skapi @JvmOverloads constructor(
 
     /**
      * Waits for a queued request (its request_id, or its short id with url and method) and returns the answer.
-     * pollMillis: milliseconds between checks, 1000 or more (0 means the default, 1000).
+     * pollMillis: milliseconds between checks, 1000 or more (0 means the default, 1000). Failures on
+     * the way (no network, timeout, 429, 5xx) never end it; it tries again, waiting longer each time
+     * up to 30 seconds. notify: the request was dispatched with "notify" and the reply said
+     * "notify": true, so the poll reads at once when a status frame names it and otherwise idles to
+     * one read a minute while frames arrive.
      */
     public suspend fun forwardRequestPoll(requestId: String, pollMillis: Long = 1000, url: String? = null, method: String? = null,
-                                          onStream: ((String, Int) -> Unit)? = null, service: String? = null, owner: String? = null): JsonElement =
-        io { core.forwardRequestPoll(requestId, pollMillis.toDouble(), url, method, onStream, service, owner).toJson() }
+                                          onStream: ((String, Int) -> Unit)? = null, service: String? = null, owner: String? = null,
+                                          notify: Boolean = false): JsonElement =
+        io { core.forwardRequestPoll(requestId, pollMillis.toDouble(), url, method, onStream, service, owner, notify).toJson() }
 
     /** Reads a streamed request's text from "since" (or the start) until it settles; returns the final answer. */
     public suspend fun forwardRequestStream(requestId: String, options: JsonObject? = null, onStream: ((String, Int) -> Unit)? = null): JsonElement =
         io { core.forwardRequestStream(requestId, options?.toAny().asMap(), onStream).toJson() }
 
-    /** Stores `data` as a streamed request's final answer, so later polls return it. */
+    /**
+     * Stores `data` as a streamed request's final answer, so later polls return it. options: "url",
+     * "method", "service", "owner", "ifAbsent" (store only when no result is stored yet; otherwise
+     * {"finalized": false, "reason": "exists"}).
+     */
     public suspend fun forwardRequestFinalize(requestId: String, data: JsonElement? = null, options: JsonObject? = null): JsonElement =
         io { core.forwardRequestFinalize(requestId, data?.toAny(), options?.toAny().asMap()).toJson() }
 
-    /** The forwarded requests you made to one url and method, with their answers. */
-    public suspend fun forwardRequestHistory(params: JsonObject, fetchOptions: FetchOptions? = null): JsonObject =
-        io { core.forwardRequestHistory(params.toAny().asMap() ?: LinkedHashMap(), fetchOptions?.toMap()).toJsonObject() }
+    /**
+     * The forwarded requests you made to one url and method, with their answers. params: "url",
+     * "method", "status", "queue", "queue_exact", "queue_exclude", "compact", "fields" ("ids": only
+     * ids, status, times, queue and cref), "after" (only rows newer than this request id),
+     * "deadline" (milliseconds, then TIMEOUT), "fresh". signal: aborts the listing (ABORTED).
+     */
+    public suspend fun forwardRequestHistory(params: JsonObject, fetchOptions: FetchOptions? = null, signal: SkapiAbortSignal? = null): JsonObject =
+        io { core.forwardRequestHistory(params.toAny().asMap() ?: LinkedHashMap(), fetchOptions?.toMap(), signal).toJsonObject() }
+
+    /**
+     * Where many forwarded requests stand, in one call per 100: status ("pending", "running",
+     * "resolved", "failed", "cancelled", or "missing" for one this caller cannot see), stream
+     * position ("last_seq", "final_seq"), "has_body", timestamps and "cref". No bodies. Strongly
+     * consistent. requests: full request ids (String) or {"id", "url", "method"} objects with the
+     * short id. options: "deadline" (milliseconds per call, then TIMEOUT), "fresh", "service",
+     * "owner". signal: aborts it (ABORTED). Returns {"list"} in the order asked.
+     */
+    public suspend fun forwardRequestStatus(requests: List<JsonElement>, options: JsonObject? = null, signal: SkapiAbortSignal? = null): JsonObject =
+        io { core.forwardRequestStatus(requests.map { it.toAny() }, options?.toAny().asMap(), signal).toJsonObject() }
+
+    /**
+     * The counters of up to 20 queues: {"queues": {name: {"cnt", "rct", "seq", "in_queue"}}}. "rct"
+     * grows when a request on the queue finishes and "seq" when one is added: read these on every
+     * tick and the requests themselves (forwardRequestStatus) only when one moved. options as
+     * forwardRequestStatus.
+     */
+    public suspend fun forwardRequestQueueCounters(queues: List<String>, options: JsonObject? = null, signal: SkapiAbortSignal? = null): JsonObject =
+        io { core.forwardRequestQueueCounters(queues, options?.toAny().asMap(), signal).toJsonObject() }
+
+    /**
+     * Reads one forwarded request in full, always as {"id", "status", "body"?, "error"?, "chunks"?,
+     * "last_seq"?, "final_seq"?, "more"?, "body_unavailable"?, ...}: a resolved request does not
+     * come back as its bare body. params: "id" (with "url" and "method", or a full id), "since" (a
+     * chunk sequence, 0 for the beginning: streamed text after it comes back too), "service",
+     * "owner", "deadline", "fresh". signal: aborts it (ABORTED).
+     */
+    public suspend fun forwardRequestRead(params: JsonObject, signal: SkapiAbortSignal? = null): JsonObject =
+        io { core.forwardRequestRead(params.toAny().asMap(), signal).toJsonObject() }
 
     /** Cancels a queued request that has not run yet: {"url", "method", "id"}. */
     public suspend fun cancelForwardRequest(params: JsonObject): JsonElement =

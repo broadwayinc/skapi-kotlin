@@ -5,9 +5,9 @@ The [Skapi](https://www.skapi.com) backend for Kotlin, Android and Java: sign us
 ```kotlin
 // build.gradle.kts
 dependencies {
-    implementation("com.skapi:skapi-kotlin:2.5.0")
-    implementation("com.skapi:skapi-android:2.5.0") // Android apps: session storage, device key store, lifecycle
-    implementation("com.skapi:skapi-java:2.5.0")    // Java code: CompletableFuture methods, plain Java maps and lists
+    implementation("com.skapi:skapi-kotlin:2.7.0")
+    implementation("com.skapi:skapi-android:2.7.0") // Android apps: session storage, device key store, lifecycle
+    implementation("com.skapi:skapi-java:2.7.0")    // Java code: CompletableFuture methods, plain Java maps and lists
 }
 ```
 

@@ -7,12 +7,25 @@ import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadFactory
 
 /** The version of skapi-kotlin, sent to the server as skapi_version. */
-public const val SKAPI_VERSION: String = "2.5.0"
+public const val SKAPI_VERSION: String = "2.7.0"
 
 internal const val TOKEN_REFRESH_SKEW_SECONDS = 60 * 60 // refresh the ID token when it has less than an hour left
 
+/**
+ * How long a token refresh may take in all, retries included (skapi-js 2.7.0). Past it the call
+ * that needed the token fails with code TIMEOUT, the user stays signed in, and the next call
+ * starts a new refresh.
+ */
+internal const val TOKEN_REFRESH_TIME_LIMIT_MS = 15_000L
+
 /** The password-free state of a sign-in waiting for an authenticator code. */
 internal class PendingMfa(val username: String, val session: String?, val password: String?)
+
+/** One token refresh: done completes when it ends, error is what it failed with. */
+internal class RefreshFlight(val seq: Long) {
+    val done = java.util.concurrent.CompletableFuture<Unit>()
+    @Volatile var error: Throwable? = null
+}
 
 /** Passed for "data" when it was left out (keep the stored data on an update), as skapi-py's _NO_DATA. */
 internal object NoData
@@ -43,8 +56,12 @@ internal class Core(
     @Volatile var user: JMap? = null
     @Volatile var restored = false
     val lock = Any()
-    /** one token refresh at a time, shared by every thread */
+    /** guards refreshFlight and refreshSeq */
     val refreshLock = Any()
+    /** the token refresh in flight, shared by every thread that needs one (as skapi-js tokenRefreshInFlight) */
+    @Volatile var refreshFlight: RefreshFlight? = null
+    /** numbers the refreshes in the order they started */
+    var refreshSeq = 0L
     /**
      * Counts sign-outs: clearSession adds one. A token refresh that started before a sign-out
      * compares it before adopting its tokens, so a refresh still running when the user logged out
@@ -70,6 +87,10 @@ internal class Core(
     /** when the server last confirmed the temporary account (ms) */
     @Volatile var lastAnonymousBeat: Long = 0
     @Volatile var rt: Realtime? = null
+    /** The request status push (RequestStatus.kt). */
+    val statusPush: StatusPush by lazy { StatusPush(this) }
+    /** one status-push connection opening at a time */
+    val statusPushOpenLock = Any()
     @Volatile var bulkPermitsUnavailable = false
     val cdnOrigins: MutableMap<String, String> = ConcurrentHashMap()
 
@@ -151,7 +172,7 @@ internal class Core(
                         // getProfile(refreshToken = true) right after this has nothing left to ask for
                         restoreRefreshedToken = session.idToken.jwtToken
                     } catch (e: CognitoError) {
-                        if (e.code != "NetworkError") throw e
+                        if (e.code != "NetworkError" && e.code != "Timeout") throw e
                         // The server never answered: that says nothing about the session, which is kept
                         // with its stored tokens. The next signed-in call refreshes again (NETWORK_ERROR
                         // while there is no network), as for a session that expires while running.
@@ -166,7 +187,7 @@ internal class Core(
                     encStartDeviceUnlock()
                 }
             } catch (e: CognitoError) {
-                if (e.code != "NetworkError") clearSession(localOnly = true)
+                if (e.code != "NetworkError" && e.code != "Timeout") clearSession(localOnly = true)
             } catch (e: SkapiException) {
                 // kept signed out
             }
@@ -223,25 +244,104 @@ internal class Core(
         return user != null && session != null
     }
 
-    /** Forced token refresh. A network failure keeps the session; any other refusal ends it. */
-    fun refreshSession() {
+    /**
+     * Forced token refresh. A network failure or no answer within TOKEN_REFRESH_TIME_LIMIT_MS
+     * (TIMEOUT) keeps the session; any other refusal ends it. Threads that need a refresh at the
+     * same time share one, as skapi-js shares its tokenRefreshInFlight, and each waits for it at
+     * most TOKEN_REFRESH_TIME_LIMIT_MS from when it started waiting (TIMEOUT past it, still signed
+     * in; the stalled refresh is no longer shared, so the next call starts a new one).
+     *
+     * newClaims: the caller just changed the user (updateProfile, verifyEmail, ...) and needs
+     * tokens issued after this call. It joins only a refresh that started after it asked; one that
+     * started earlier could carry the old claims, so it is waited out (within the time limit) and a
+     * new refresh is started.
+     * onlyIfStale: skip the refresh when the ID token is no longer within the refresh skew (another
+     * thread refreshed it meanwhile).
+     * control: the caller's deadline and abort also end its wait.
+     */
+    fun refreshSession(newClaims: Boolean = false, control: RequestControl? = null, onlyIfStale: Boolean = false) {
+        val mark: Long
+        val earlier: RefreshFlight?
         synchronized(refreshLock) {
+            if (session == null) throw skErr("User login is required.", "INVALID_REQUEST")
+            mark = refreshSeq // a refresh numbered above this started after this call
+            earlier = if (newClaims) refreshFlight else null
+        }
+        if (earlier != null) {
+            try {
+                waitRefresh(earlier, control)
+            } catch (e: SkapiException) {
+                if (e.code == "TIMEOUT" || e.code == "ABORTED") throw e
+                // its own failure is not this caller's answer: the new refresh below gives that
+            }
+        }
+        val flight = synchronized(refreshLock) {
             val current = session ?: throw skErr("User login is required.", "INVALID_REQUEST")
-            val epoch = signOuts
             val username = cognitoUsername ?: throw skErr("User login is required.", "INVALID_REQUEST")
+            var f = refreshFlight
+            if (f == null && onlyIfStale && !stale(current)) return
+            if (f == null || (newClaims && f.seq <= mark)) {
+                refreshSeq += 1
+                val started = RefreshFlight(refreshSeq)
+                refreshFlight = started
+                val epoch = signOuts
+                val refreshToken = current.refreshToken
+                Thread({ runRefresh(started, epoch, username, refreshToken) }, "skapi-token-refresh")
+                    .also { it.isDaemon = true }.start()
+                f = started
+            }
+            f
+        }
+        waitRefresh(flight, control)
+    }
+
+    private fun stale(s: Session): Boolean =
+        (s.idToken.expiration ?: 0) < System.currentTimeMillis() / 1000 + TOKEN_REFRESH_SKEW_SECONDS
+
+    /** Waits for a refresh at most TOKEN_REFRESH_TIME_LIMIT_MS; throws its error, or TIMEOUT. */
+    private fun waitRefresh(flight: RefreshFlight, control: RequestControl?) {
+        if (!awaitWithin(flight.done, TOKEN_REFRESH_TIME_LIMIT_MS, control)) {
+            synchronized(refreshLock) {
+                // stops sharing the stalled refresh, so the next call tries again
+                if (refreshFlight === flight) refreshFlight = null
+            }
+            throw skErr("The sign-in token refresh did not answer within ${TOKEN_REFRESH_TIME_LIMIT_MS / 1000} seconds.", "TIMEOUT")
+        }
+        when (val err = flight.error) {
+            null -> return
+            // a copy for each waiting caller, so what one caller marks on it stays its own
+            is SkapiException -> throw SkapiException(err.message, err.code, err.cause ?: err, err.details)
+            else -> throw err
+        }
+    }
+
+    /** The refresh itself, on its own thread: it runs to its end even when nobody waits any more. */
+    private fun runRefresh(flight: RefreshFlight, epoch: Int, username: String, refreshToken: String) {
+        try {
             val pool = userPool()
             val fresh = try {
-                pool.refresh(username, current.refreshToken)
+                pool.refresh(username, refreshToken)
             } catch (e: CognitoError) {
                 if (signOuts != epoch) signedOutMeanwhile(pool, username)
                 if (e.code == "NetworkError") throw skErr("Network error", "NETWORK_ERROR", e)
-                clearSession()
+                if (e.code == "Timeout") {
+                    throw skErr("The sign-in token refresh did not answer within ${TOKEN_REFRESH_TIME_LIMIT_MS / 1000} seconds.", "TIMEOUT", e)
+                }
+                // the server refused the refresh: the session ends (unless another user signed in meanwhile)
+                if (cognitoUsername == username) clearSession()
                 throw skErr("User login is required.", "INVALID_REQUEST", e)
             }
             synchronized(sessionLock) {
                 if (signOuts != epoch) signedOutMeanwhile(pool, username)
                 adoptSession(username, fresh)
             }
+        } catch (e: Throwable) {
+            flight.error = e // handed to the waiting callers
+        } finally {
+            synchronized(refreshLock) {
+                if (refreshFlight === flight) refreshFlight = null
+            }
+            flight.done.complete(Unit)
         }
     }
 
@@ -258,25 +358,23 @@ internal class Core(
         throw skErr("User login is required.", "INVALID_REQUEST")
     }
 
-    fun freshIdToken(): String {
+    /**
+     * The ID token, refreshed first when it has less than TOKEN_REFRESH_SKEW_SECONDS left (joining
+     * a refresh another thread already started; waiting at most the refresh time limit, or the
+     * caller's deadline or abort when `control` is given).
+     */
+    fun freshIdToken(control: RequestControl? = null): String {
         restore()
         var s = session
         if (s == null) {
             clearSession()
             throw skErr("User login is required.", "INVALID_REQUEST")
         }
-        val now = System.currentTimeMillis() / 1000
-        if ((s.idToken.expiration ?: 0) < now + TOKEN_REFRESH_SKEW_SECONDS) {
-            synchronized(refreshLock) {
-                // another thread may have refreshed (or ended the session) while this one waited
-                s = session ?: throw skErr("User login is required.", "INVALID_REQUEST")
-                if ((s!!.idToken.expiration ?: 0) < System.currentTimeMillis() / 1000 + TOKEN_REFRESH_SKEW_SECONDS) {
-                    refreshSession()
-                    s = session ?: throw skErr("User login is required.", "INVALID_REQUEST")
-                }
-            }
+        if (stale(s)) {
+            refreshSession(control = control, onlyIfStale = true)
+            s = session ?: throw skErr("User login is required.", "INVALID_REQUEST")
         }
-        return s!!.idToken.jwtToken
+        return s.idToken.jwtToken
     }
 
     fun accessToken(): String {
@@ -291,10 +389,28 @@ internal class Core(
         method: String = "POST",
         fetchOptions: JMap? = null,
         ignoreService: Boolean = false,
+        control: RequestControl? = null,
     ): Any? {
-        ensureConnection()
-        val token = if (auth) freshIdToken() else null
-        return requester.request(path, data, auth = auth, method = method, token = token, fetchOptions = fetchOptions, ignoreService = ignoreService)
+        control?.check()
+        if (control != null && (connection == null || (auth && !restored))) {
+            // the deadline counts from this call: the wait for the connection is part of it
+            control.bounded { ensureConnection(); if (auth) restore() }
+        } else {
+            ensureConnection()
+        }
+        val token = if (auth) {
+            try {
+                freshIdToken(control)
+            } catch (e: SkapiException) {
+                // Marked so a caller can tell "this client could not get a token" (no answer from
+                // the sign-in service, or a session that is gone) from the server's answer. Not
+                // when the caller itself gave up (its deadline or abort).
+                if (control == null || !control.gaveUp()) e.tokenFailure = true
+                throw e
+            }
+        } else null
+        return requester.request(path, data, auth = auth, method = method, token = token, fetchOptions = fetchOptions,
+            ignoreService = ignoreService, control = control)
     }
 
     /** The signed-in user's profile (a copy), or null. */

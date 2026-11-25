@@ -18,6 +18,12 @@ public class SkapiException(
     public val details: JsonElement? = null,
 ) : Exception(message, cause) {
     override fun toString(): String = "$code: $message"
+
+    /**
+     * Set when the request failed before it was sent because no sign-in token could be had (the
+     * refresh got no answer, timed out, or the session is gone): the server never saw it.
+     */
+    @Volatile internal var tokenFailure: Boolean = false
 }
 
 /** A SkapiException whose cause may be an exception or a server answer (as skapi-py's cause). */

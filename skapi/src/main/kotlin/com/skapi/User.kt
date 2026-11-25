@@ -353,7 +353,7 @@ internal fun Core.getProfile(refreshToken: Boolean = false): JMap? {
             // the stored tokens had expired and were just refreshed: one refresh, not two
             restoreRefreshedToken = null
         } else {
-            refreshSession()
+            refreshSession(newClaims = true)
         }
         userCopy()
     } catch (e: SkapiException) {
@@ -537,7 +537,7 @@ internal fun Core.updateProfile(paramsIn: JMap?): JMap? {
         } catch (err: CognitoError) {
             throw SkapiException(err.message ?: "Failed to update user settings.", err.code, err)
         }
-        refreshSession()
+        refreshSession(newClaims = true)
     }
     return userCopy()
 }
@@ -627,7 +627,7 @@ internal fun Core.verifyEmail(code: String? = null, template: JMap? = null): Str
     try {
         if (!code.isNullOrEmpty()) {
             userPool().call("VerifyUserAttribute", accessToken(), "AttributeName" to "email", "Code" to code)
-            refreshSession()
+            refreshSession(newClaims = true)
             user?.set("email_verified", true)
             return "SUCCESS: \"email\" is verified."
         }
@@ -644,7 +644,7 @@ internal fun Core.lastVerifiedEmail(revert: Boolean? = null): Any? {
     val body = if (revert == null) jmap() else jmap("revert" to revert)
     val reply = call("last-verified-email", body, auth = true)
     if (reply is String && "SUCCESS" in reply) {
-        refreshSession()
+        refreshSession(newClaims = true)
         return userCopy()
     }
     return reply

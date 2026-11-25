@@ -6,7 +6,9 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import java.util.TreeMap
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -78,6 +80,14 @@ private class SendWindow(val group: String, val items: MutableList<Any?>, val ba
 /** The live state of one Skapi object's realtime connection. */
 internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) {
     @Volatile var ws: RtSocket? = null
+    /** Opened by the request status push, not by the app (which takes it over by calling connectRealtime). */
+    @Volatile var ownedByStatusPush = false
+    /**
+     * Ends when the first socket opened, or with the error of an open that failed (or a close
+     * before it opened). connectRealtime waits on it when it takes over a connection the request
+     * status push is still opening.
+     */
+    val firstOpen = CompletableFuture<Unit>()
     val lock = Any()
     private val openLock = ReentrantLock()
     @Volatile var closing = false
@@ -165,7 +175,9 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
                 }
             }
             sock.readyLatch.countDown()
+            firstOpen.complete(Unit)
             startPinging(sock, sock.generation)
+            core.statusPush.socketUp(this)
             if (renew && old != null) {
                 old.endHandled = true
                 old.closed = true
@@ -223,6 +235,7 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
         val gen = sock.generation
         if (gen < 0) return
         if (current(gen)) {
+            core.statusPush.socketDown(this)
             emit(jmap("type" to "error", "message" to "Skapi: WebSocket unexpected close."))
             scheduleReconnect(gen)
         } else if (closing && gen == generation) {
@@ -241,6 +254,9 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
     }
 
     fun current(gen: Int): Boolean = gen == generation && !closing
+
+    /** True while the current socket is open. */
+    fun socketOpen(): Boolean = !closing && ws?.let { it.opened && !it.closed } == true
 
     private fun startPinging(sock: RtSocket, gen: Int) {
         sock.nextPing = now()
@@ -307,6 +323,7 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
         }
         sock.closed = true
         try { sock.ws.cancel() } catch (e: Exception) { }
+        core.statusPush.socketDown(this)
         emit(jmap("type" to "error", "message" to "Skapi: WebSocket unexpected close."))
         scheduleReconnect(gen)
     }
@@ -407,6 +424,13 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
         val batch = data["#batch"].asList()
         if (batch != null) {
             for (entry in batch) entry.asMap()?.let { readFrame(it) }
+            return
+        }
+        if (isStatusPushFrame(data)) {
+            // A request status push (skapi-js 2.5.0): the server sends it to every connection of
+            // the user, so it arrives here whether or not this client asked for it. Not a message
+            // for the app: no user sent it.
+            core.statusPush.onFrame(this, data)
             return
         }
         var kind: String? = null
@@ -595,6 +619,8 @@ internal class Realtime(val core: Core, @Volatile var callback: (JMap) -> Unit) 
             }
         }
         forgetOrder()
+        firstOpen.completeExceptionally(skErr("WebSocket closed before it opened.", "INVALID_REQUEST"))
+        core.statusPush.socketDown(this)
     }
 }
 
@@ -610,6 +636,18 @@ internal fun Core.connectRealtime(callback: (JMap) -> Unit) {
     val existing = rt
     if (existing != null && !existing.closing) {
         existing.callback = callback
+        // a connection the request status push opened is the app's from now on
+        existing.ownedByStatusPush = false
+        statusPush.adoptedByApp(existing)
+        // One the status push is still opening: returns once it is connected, as for one opened
+        // here, and a failed open is this call's failure.
+        try {
+            existing.firstOpen.get()
+        } catch (e: ExecutionException) {
+            if (rt === existing) rt = null
+            existing.emit(jmap("type" to "error", "message" to "Skapi: WebSocket connection failed."))
+            throw (e.cause as? SkapiException) ?: skErr("WebSocket closed before it opened.", "INVALID_REQUEST", e.cause)
+        }
         return
     }
     val r = Realtime(this, callback)
@@ -618,9 +656,36 @@ internal fun Core.connectRealtime(callback: (JMap) -> Unit) {
         r.open()
     } catch (e: SkapiException) {
         rt = null
+        r.firstOpen.completeExceptionally(e)
         r.emit(jmap("type" to "error", "message" to "Skapi: WebSocket connection failed."))
         throw e
     }
+}
+
+/**
+ * Opens the realtime connection for the request status push when none exists and a user is signed
+ * in. Returns the connection it opened, or null when it opened none.
+ */
+internal fun Core.openRealtimeForStatusPush(): Realtime? {
+    ensureConnection()
+    if (!signedIn()) return null
+    val r: Realtime
+    synchronized(statusPushOpenLock) {
+        val existing = rt
+        if (existing != null && !existing.closing) return null
+        r = Realtime(this) { }
+        r.ownedByStatusPush = true
+        rt = r
+    }
+    try {
+        r.open()
+    } catch (e: Exception) {
+        if (rt === r) rt = null
+        // connectRealtime may have taken this connection over meanwhile: it waits on this
+        r.firstOpen.completeExceptionally(e)
+        throw e
+    }
+    return r
 }
 
 /** Closes the realtime connection; the group hears that you disconnected and left. */

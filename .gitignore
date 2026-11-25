@@ -29,3 +29,6 @@ secring.*
 
 PUBLISHING.md
 release.sh
+
+# Claude Code local state (session worktrees are git checkouts of their own)
+.claude/

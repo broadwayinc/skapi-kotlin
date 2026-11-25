@@ -69,7 +69,7 @@ internal class CognitoClient(region: String, base: OkHttpClient) {
         .build()
 
     /** One call to the user pool API. Keys whose value is null are left out, as JSON.stringify drops undefined. */
-    fun request(operation: String, params: JMap): JMap {
+    fun request(operation: String, params: JMap, timeLimitMs: Long? = null): JMap {
         val clean = LinkedHashMap<String, Any?>()
         for ((k, v) in params) if (v != null) clean[k] = v
         val req = Request.Builder().url(endpoint)
@@ -78,8 +78,10 @@ internal class CognitoClient(region: String, base: OkHttpClient) {
             .header("Cache-Control", "no-store")
             .post(utf8(jsJson(clean)).toRequestBody(null))
             .build()
+        val call = client.newCall(req)
+        if (timeLimitMs != null) call.timeout().timeout(Math.max(1L, timeLimitMs), TimeUnit.MILLISECONDS)
         try {
-            client.newCall(req).execute().use { resp ->
+            call.execute().use { resp ->
                 val raw = resp.body?.bytes() ?: ByteArray(0)
                 val data = if (raw.isEmpty()) LinkedHashMap() else (parseJsonOrNull(utf8Dec(raw)).getOrNull().asMap() ?: LinkedHashMap())
                 if (resp.isSuccessful) return data
@@ -91,6 +93,10 @@ internal class CognitoClient(region: String, base: OkHttpClient) {
                 if (!header.isNullOrEmpty()) throw CognitoError(resp.code.toString(), header.split(":")[0], resp.code)
                 throw CognitoError(resp.code.toString(), "UnknownError", resp.code)
             }
+        } catch (e: java.io.InterruptedIOException) {
+            // the time limit of the whole call (timeLimitMs) ran out
+            if (timeLimitMs != null && e.message == "timeout") throw CognitoError("Timeout", "Timeout")
+            throw CognitoError("Network error", "NetworkError")
         } catch (e: IOException) {
             throw CognitoError("Network error", "NetworkError")
         }
@@ -101,14 +107,23 @@ internal class CognitoClient(region: String, base: OkHttpClient) {
      * refresh: waits of about 0.2, 0.4, 0.8, 1.6 and 3.2 seconds (plus up to 0.1 s), then gives
      * up when the next wait would pass 5 seconds.
      */
-    fun requestWithRetry(operation: String, params: JMap): JMap {
+    fun requestWithRetry(operation: String, params: JMap, timeLimitMs: Long? = null): JMap {
         var attempt = 1
+        val startedAt = System.nanoTime()
+        fun left(): Long? = timeLimitMs?.let { it - (System.nanoTime() - startedAt) / 1_000_000 }
         while (true) {
+            val before = left()
+            if (before != null && before <= 0) throw CognitoError("Timeout", "Timeout")
             try {
-                return request(operation, params)
+                return request(operation, params, before)
             } catch (e: CognitoError) {
+                if (e.code == "Timeout") throw e
                 val delay = Math.pow(2.0, attempt.toDouble()) * 100 + 100 * Math.random()
                 if (delay > 5000) throw e
+                // The retries stay inside the time limit too. An answer from the server (a refused
+                // refresh token, a deleted user) is kept as it is: only "no answer" becomes Timeout.
+                val now = left()
+                if (now != null && now <= delay) throw if (e.status != null) e else CognitoError("Timeout", "Timeout")
                 Thread.sleep(delay.toLong())
                 attempt++
             }
@@ -259,7 +274,10 @@ internal class UserPool(val userPoolId: String, val clientId: String, val storag
         }
         val params = jmap("ClientId" to clientId, "AuthFlow" to "REFRESH_TOKEN_AUTH", "AuthParameters" to auth)
         val result = try {
-            client.requestWithRetry("InitiateAuth", params)
+            // 2.7.0: a refresh gets TOKEN_REFRESH_TIME_LIMIT_MS in all, retries included. A connection
+            // that stalls (after a sleep, a network change) instead of failing then ends with
+            // code "Timeout" and the session is kept, rather than holding every signed-in call.
+            client.requestWithRetry("InitiateAuth", params, TOKEN_REFRESH_TIME_LIMIT_MS)
         } catch (e: CognitoError) {
             if (e.code == "NotAuthorizedException") clearCachedTokens(user)
             throw e

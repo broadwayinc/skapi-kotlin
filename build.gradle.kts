@@ -7,5 +7,5 @@ plugins {
 
 allprojects {
     group = "com.skapi"
-    version = "2.5.0"
+    version = "2.7.0"
 }

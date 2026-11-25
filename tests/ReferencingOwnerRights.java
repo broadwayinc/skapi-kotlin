@@ -1,4 +1,4 @@
-// Offline checks for the 2.5.0 record changes: source.can_modify_referencing_records,
+// Offline checks for the 2.5.0 record changes (version check: current release): source.can_modify_referencing_records,
 // record "updated_by" (prv_acs.upb) and the redacted "ip" field. No network calls.
 //
 // The repo has no test source set, so this is a single-file Java program run against the built
@@ -73,7 +73,7 @@ public class ReferencingOwnerRights {
         core.setUser(map("user_id", "user-a"));
         core.setSession(new com.skapi.Session(null, null, null, 0L));
 
-        test("version is 2.5.0", () -> eq(com.skapi.CoreKt.SKAPI_VERSION, "2.5.0", "SKAPI_VERSION"));
+        test("version is 2.7.0", () -> eq(com.skapi.CoreKt.SKAPI_VERSION, "2.7.0", "SKAPI_VERSION"));
 
         test("postRecord accepts source.can_modify_referencing_records as a boolean", () -> {
             Map<String, Object> on = config(map(

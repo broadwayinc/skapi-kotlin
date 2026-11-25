@@ -8,8 +8,11 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.text.SimpleDateFormat
 import java.util.Locale
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
 
 /*
@@ -70,13 +73,22 @@ private fun rateLimitWaitMs(delay: Double, attempt: Int): Double {
     return base + Math.floor(Math.random() * Math.min(1000.0, Math.max(50.0, base * 0.25)))
 }
 
-/** A non-2xx answer as a SkapiException, read the way skapi-js reads it. */
-internal fun parseError(status: Int, text: String): SkapiException {
+/**
+ * A non-2xx answer as a SkapiException, read the way skapi-js reads it.
+ *
+ * serverFault (2.7.0, on by default): a 5xx other than 501 is a server fault, not a refusal, so it
+ * is SERVER_ERROR whatever the body says (the body is kept as the cause), and a caller can tell
+ * "try again" from "no". 501 says the route does not exist here, which is an answer. Uploads pass
+ * false: they read errors as skapi-js uploads do (toFileUploadError).
+ */
+internal fun parseError(status: Int, text: String, serverFault: Boolean = true): SkapiException {
+    val fault = serverFault && status >= 500 && status != 501
     val body: Any? = parseJsonOrNull(text).getOrElse { text }
     if (body is String) {
         val parts = body.split(":")
         val code = parts[0].trim()
         val message = parts.drop(1).joinToString(":").trim()
+        if (fault) return skErr(message.ifEmpty { body }.ifEmpty { "Server error $status." }, "SERVER_ERROR", body.ifEmpty { null })
         return skErr(message.ifEmpty { body }, if (code in KNOWN_ERROR_CODES) code else "ERROR")
     }
     val m = body.asMap()
@@ -84,9 +96,85 @@ internal fun parseError(status: Int, text: String): SkapiException {
         val code = m["code"]?.takeIf { truthy(it) }?.let { if (it is String) it else jsJson(it) } ?: status.toString()
         val message = (m["message"] as? String ?: "").trim().ifEmpty { code }
         val cause = if (m.containsKey("cause")) m["cause"] else if (m.containsKey("stage")) m else null
+        if (fault) return skErr(message, "SERVER_ERROR", cause ?: m)
         return skErr(message, code, cause)
     }
+    if (fault) return skErr("Server error $status.", "SERVER_ERROR", body)
     return skErr(if (body is String) body else jsJson(body), "ERROR")
+}
+
+/**
+ * A caller's hold on one request (2.7.0): a deadline (milliseconds in all, from the call) and an
+ * abort signal. Past the deadline the request fails with TIMEOUT, an abort fails it with ABORTED,
+ * and either one cancels the call on the network.
+ */
+internal class RequestControl(deadlineMs: Double?, val signal: SkapiAbortSignal?) {
+    val deadlineMs: Long? = deadlineMs?.toLong()
+    private val startedAt = System.nanoTime()
+
+    /** Milliseconds left, or null for no deadline. */
+    fun remainingMs(): Long? = deadlineMs?.let { it - (System.nanoTime() - startedAt) / 1_000_000 }
+
+    fun timeoutError(): SkapiException = skErr("No answer within $deadlineMs ms.", "TIMEOUT")
+
+    /** Throws when the caller gave up (aborted or past the deadline). */
+    fun check() {
+        if (signal?.aborted == true) throw skErr("Aborted", "ABORTED")
+        val left = remainingMs()
+        if (left != null && left <= 0) throw timeoutError()
+    }
+
+    /** True once the caller gave up (aborted or past the deadline). */
+    fun gaveUp(): Boolean = signal?.aborted == true || (remainingMs()?.let { it <= 0 } ?: false)
+
+    /** Waits `ms` (a back-off), cut short by an abort (ABORTED) or the deadline (TIMEOUT). */
+    fun pause(ms: Long) {
+        awaitWithin(CompletableFuture<Unit>(), ms, this)
+    }
+
+    /**
+     * Runs `block` (the wait for the connection, a sign-in restored from storage) on its own thread
+     * and waits for it within the deadline; an abort ends the wait at once. When the caller gives
+     * up, the block still runs to its end for the calls that come after.
+     */
+    fun <T> bounded(block: () -> T): T {
+        val done = CompletableFuture<T>()
+        Thread({
+            try { done.complete(block()) } catch (e: Throwable) { done.completeExceptionally(e) }
+        }, "skapi-request").also { it.isDaemon = true }.start()
+        awaitWithin(done, null, this)
+        try {
+            return done.get()
+        } catch (e: ExecutionException) {
+            throw e.cause ?: e
+        }
+    }
+}
+
+/**
+ * Waits for `future` at most `limitMs` (null: no limit of its own) and at most the caller's
+ * deadline; the caller's abort ends the wait at once. Returns true once the future is done, false
+ * when limitMs ran out; throws ABORTED, or TIMEOUT when the deadline came first. The future is
+ * left running either way.
+ */
+internal fun awaitWithin(future: CompletableFuture<*>, limitMs: Long?, control: RequestControl?): Boolean {
+    val left = control?.remainingMs()
+    val byDeadline = left != null && (limitMs == null || left < limitMs)
+    val wait = if (byDeadline) Math.max(0L, left!!) else limitMs
+    val wake = CompletableFuture<Unit>()
+    future.whenComplete { _, _ -> wake.complete(Unit) }
+    val unhook = control?.signal?.onAbort { wake.complete(Unit) } ?: {}
+    try {
+        if (wait == null) wake.get() else wake.get(wait, TimeUnit.MILLISECONDS)
+    } catch (e: TimeoutException) {
+        // the time is up: said below
+    } finally {
+        unhook()
+    }
+    if (future.isDone) return true
+    control?.check()
+    if (byDeadline) throw control!!.timeoutError()
+    return false
 }
 
 internal class Requester(
@@ -120,15 +208,24 @@ internal class Requester(
 
     private fun fetchEndpointFile(name: String): JMap {
         val url = "https://$targetCdn.cloudfront.net/${service.take(4)}/$name-$ENDPOINT_VERSION.json"
+        // Only the CDN's "no such file" (403 or 404) means the project does not exist. Anything else is
+        // a failure on the way, reported with a code a caller (and a poll) retries: before, a passing
+        // CDN error or a cut-off answer said "The project ID does not exist", and the next call, which
+        // fetches the list again, worked.
         try {
             client.newCall(Request.Builder().url(url).get().build()).execute().use { resp ->
                 val text = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) throw skErr("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS")
+                when {
+                    resp.code == 403 || resp.code == 404 ->
+                        throw skErr("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS")
+                    resp.code == 429 -> throw skErr("Too many requests", "RATE_LIMITED")
+                    !resp.isSuccessful -> throw skErr("Server error ${resp.code}.", "SERVER_ERROR")
+                }
                 return parseJsonOrNull(text).getOrNull().asMap()
-                    ?: throw skErr("The project ID does not exist. Create your project from skapi.com", "NOT_EXISTS")
+                    ?: throw skErr("Network error: the project's endpoint list \"$name\" arrived incomplete.", "NETWORK_ERROR")
             }
         } catch (e: IOException) {
-            throw skErr("Network error", "NETWORK_ERROR", e)
+            throw transportFailure(e, null)
         }
     }
 
@@ -195,7 +292,9 @@ internal class Requester(
         contentType: String? = "application/json",
         raw: Boolean = false,
         extraHeaders: Map<String, String>? = null,
+        control: RequestControl? = null,
     ): Any? {
+        control?.check()
         val m = method.uppercase()
         var url = endpointUrl(dest, auth, stableGateway)
         val dataMap = data.asMap()
@@ -292,7 +391,7 @@ internal class Requester(
             payload = utf8(jsJson(body))
         }
 
-        var result = send(url, m, headers, payload, raw)
+        var result = send(url, m, headers, payload, raw, control = control)
 
         val rm = result.asMap()
         if (historyKey != null && rm != null && truthy(rm["startKey"])) {
@@ -307,9 +406,10 @@ internal class Requester(
     }
 
     fun send(url: String, method: String, headers: Map<String, String>, payload: ByteArray?, raw: Boolean = false,
-             uploadName: String? = null): Any? {
+             uploadName: String? = null, control: RequestControl? = null): Any? {
         var attempt = 0
         while (true) {
+            control?.check()
             val hb = Headers.Builder()
             for ((k, v) in headers) hb.addUnsafeNonAscii(k, v)
             val body = if (method == "GET" || method == "HEAD") null else (payload ?: ByteArray(0)).toRequestBody(null)
@@ -318,8 +418,15 @@ internal class Requester(
             } catch (e: IllegalArgumentException) {
                 throw perr("\"$url\" is not a valid url.")
             }
+            val call = (if (uploadName != null) uploadClient else client).newCall(req)
+            var unhook: () -> Unit = {}
+            if (control != null) {
+                // The caller's deadline bounds this attempt; an abort cancels it on the network.
+                control.remainingMs()?.let { call.timeout().timeout(Math.max(1L, it), TimeUnit.MILLISECONDS) }
+                control.signal?.let { sig -> unhook = sig.onAbort { call.cancel() } }
+            }
             try {
-                (if (uploadName != null) uploadClient else client).newCall(req).execute().use { resp ->
+                call.execute().use { resp ->
                     val content = resp.body?.bytes() ?: ByteArray(0)
                     if (resp.isSuccessful) {
                         if (raw) return content
@@ -335,29 +442,45 @@ internal class Requester(
                                 val carried = parseError(resp.code, text)
                                 if (carried.code != "ERROR" && carried.code != "429") throw carried
                             }
-                            throw skErr("Too many requests", "ERROR")
+                            // 2.7.0: a typed transport failure. Uploads say TOO_MANY_REQUESTS, as skapi-js uploads do.
+                            throw skErr("Too many requests", if (uploadName != null) "TOO_MANY_REQUESTS" else "RATE_LIMITED")
                         }
                         if (attempt >= RATE_LIMIT_MAX_RETRIES) {
                             throw skErr("Too many requests: \"${url.substringBefore('?')}\" still answered 429 after $RATE_LIMIT_MAX_RETRIES retries.", "TOO_MANY_REQUESTS")
                         }
-                        Thread.sleep(rateLimitWaitMs(delay, attempt).toLong())
+                        val pause = rateLimitWaitMs(delay, attempt).toLong()
+                        // the caller's deadline and abort cut the wait short
+                        if (control != null) control.pause(pause) else Thread.sleep(pause)
                         attempt++
                         return@use
                     }
-                    throw parseError(resp.code, text)
+                    throw parseError(resp.code, text, serverFault = uploadName == null)
                 }
-            } catch (e: SocketTimeoutException) {
-                if (uploadName != null) {
-                    throw skErr("Upload timeout: \"$uploadName\" stalled (nothing sent for $timeoutSeconds seconds, " +
-                        "or no answer ${timeoutSeconds * UPLOAD_SENT_WAIT_FACTOR} seconds after it was sent).", "TIMEOUT", e)
-                }
-                // Nothing moved for timeoutSeconds (OkHttp's read/write timeouts are idle limits): TIMEOUT,
-                // as skapi-js 2.4.4 does ("No response for 60 seconds.").
-                throw skErr("No response for $timeoutSeconds seconds.", "TIMEOUT", e)
             } catch (e: IOException) {
-                throw skErr("Network error", "NETWORK_ERROR", e)
+                // The caller gave up: that, not the cancelled call, is the error.
+                if (control != null) {
+                    if (control.signal?.aborted == true) throw skErr("Aborted", "ABORTED", e)
+                    val left = control.remainingMs()
+                    if (left != null && left <= 0) throw control.timeoutError()
+                }
+                throw transportFailure(e, uploadName)
+            } finally {
+                unhook()
             }
         }
+    }
+
+    private fun transportFailure(e: IOException, uploadName: String?): SkapiException {
+        if (e is SocketTimeoutException) {
+            if (uploadName != null) {
+                return skErr("Upload timeout: \"$uploadName\" stalled (nothing sent for $timeoutSeconds seconds, " +
+                    "or no answer ${timeoutSeconds * UPLOAD_SENT_WAIT_FACTOR} seconds after it was sent).", "TIMEOUT", e)
+            }
+            // Nothing moved for timeoutSeconds (OkHttp's read/write timeouts are idle limits): TIMEOUT,
+            // as skapi-js 2.4.4 does ("No response for 60 seconds.").
+            return skErr("No response for $timeoutSeconds seconds.", "TIMEOUT", e)
+        }
+        return skErr("Network error", "NETWORK_ERROR", e)
     }
 
     /** A plain GET with no extra headers: for pre-signed links, whose signature covers the headers. */
